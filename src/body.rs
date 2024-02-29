@@ -10,7 +10,7 @@ use crate::cache;
 use crate::cache::ResponseCache;
 
 macro_rules! poll_anyhow {
-	// Converts a hyper Body::poll_frame returning errors of any type into errors of anyhow type
+    // Converts a hyper Body::poll_frame returning errors of any type into errors of anyhow type
     ($body:ident, $cx:ident) => {
         match Body::poll_frame(Pin::new($body), $cx) {
             Poll::Pending => Poll::Pending,
@@ -62,7 +62,7 @@ impl<Cache: cache::ResponseCache> Body for CacheBody<Cache> {
         match self.get_mut() {
             CacheBody::Skip(inc) => poll_anyhow!(inc, cx),
             CacheBody::Sink(sink) => Body::poll_frame(Pin::new(sink), cx),
-            CacheBody::Source(source) => poll_anyhow!(source, cx)
+            CacheBody::Source(source) => poll_anyhow!(source, cx),
         }
     }
 }
@@ -129,8 +129,8 @@ impl<Cache: cache::ResponseCache> Body for IncomingTeeSink<Cache> {
 
 impl<Cache: cache::ResponseCache> Drop for IncomingTeeSink<Cache> {
     fn drop(&mut self) {
-		let mut sink = self.sink.take().unwrap();
-		let cache = self.cache.take().unwrap();
+        let mut sink = self.sink.take().unwrap();
+        let cache = self.cache.take().unwrap();
         if self.inc.is_end_stream() {
             for frame in self.frame_data.iter() {
                 for byte in frame.into_iter() {

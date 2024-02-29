@@ -6,9 +6,9 @@ use std::pin::Pin;
 use anyhow::Context;
 use body::CacheBody;
 use body::IncomingTeeSink;
-use cache::RedisCache;
 use cache::bytes_to_parts;
 use cache::response_to_bytes;
+use cache::RedisCache;
 use cache::ResponseCache;
 use cache::CACHE_HEADER;
 use fred::prelude::*;
@@ -184,8 +184,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     let target_host = "neverssl.com";
     let target_port = 80;
-	let redis_pool = Builder::default_centralized().build_pool(10)?;
-	redis_pool.init().await?;
+    let redis_pool = Builder::default_centralized().build_pool(10)?;
+    redis_pool.init().await?;
     let http_client = ClientConnectionManager::new(format!("{}:{}", target_host, target_port));
     let pool = Pool::builder().max_open(10).build(http_client);
     // We create a TcpListener and bind it to 127.0.0.1:3000
@@ -198,9 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         lru: RedisCache::new(redis_pool),
         http_client: pool,
     };
-	tokio::task::spawn_blocking(move ||  {
-		
-	});
+    tokio::task::spawn_blocking(move || {});
 
     // We start a loop to continuously accept incoming connections
     loop {
