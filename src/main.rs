@@ -1,19 +1,17 @@
 use std::borrow::Cow;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 
 use anyhow::Context;
 use body::CacheBody;
 use body::IncomingTeeSink;
+use cache::RedisCache;
 use cache::bytes_to_parts;
 use cache::response_to_bytes;
-use cache::MemCache;
 use cache::ResponseCache;
 use cache::CACHE_HEADER;
+use fred::prelude::*;
 use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::body::Incoming;
@@ -24,7 +22,6 @@ use hyper::Method;
 use hyper::{server::conn::http1, service::Service};
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use lru::LruCache;
 use mobc::Pool;
 use pool::ClientConnectionManager;
 use tokio::net::TcpListener;
@@ -40,8 +37,8 @@ struct Config<'a> {
 }
 
 #[derive(Clone)]
-struct CachingProxy<'config> {
-    lru: MemCache,
+struct CachingProxy<'config, Cache> {
+    lru: Cache,
     config: Config<'config>,
     http_client: Pool<ClientConnectionManager>,
 }
@@ -51,7 +48,7 @@ struct RequestCacheControl {
     write_cache: bool,
 }
 
-impl<'config> CachingProxy<'config> {
+impl<'config, Cache: ResponseCache> CachingProxy<'config, Cache> {
     fn configure_caching(
         &self,
         req: &Request<Incoming>,
@@ -86,62 +83,62 @@ impl<'config> CachingProxy<'config> {
         }
     }
 
-    fn read_cache(
-        &self,
+    async fn read_cache(
+        cache: &Cache,
         config: &RequestCacheControl,
         key: &str,
-    ) -> Result<Option<Vec<u8>>, anyhow::Error> {
+    ) -> Result<Option<Vec<u8>>, Cache::Error> {
         if config.read_cache {
-            self.lru.get_key(key)
+            Ok(cache.get_key(key).await?)
         } else {
             Ok(None)
         }
     }
 }
 
-impl<'config> Service<Request<Incoming>> for CachingProxy<'config> {
-    type Response = Response<CacheBody<MemCache>>;
+impl<'config, Cache: ResponseCache> Service<Request<Incoming>> for CachingProxy<'config, Cache> {
+    type Response = Response<CacheBody<Cache>>;
 
     type Error = anyhow::Error;
 
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         let key = format!("{}::{}", req.uri().path(), req.uri().query().unwrap_or(""));
+        let host = format!("{}:{}", self.config.target_host, self.config.target_port);
         let handle_error = |err: anyhow::Error| Box::pin(async move { Err(err) });
         let cache_config = match self.configure_caching(&req) {
             Ok(config) => config,
             Err(err) => return handle_error(err),
         };
+        let http_client = self.http_client.clone();
+        let cache = self.lru.clone();
         // TODO check VARY
         // TODO nix this unwrap
-        match self.read_cache(&cache_config, &key).unwrap() {
-            Some(response) => Box::pin(async move {
-                let (status, headers, body) = bytes_to_parts(&response);
-                let mut builder = Response::builder().status(status);
-                for (k, v) in headers.into_iter() {
-                    builder = builder.header(k.unwrap(), v);
+        Box::pin(async move {
+            match Self::read_cache(&cache, &cache_config, &key).await.unwrap() {
+                Some(response) => {
+                    let (status, headers, body) = bytes_to_parts(&response);
+                    let mut builder = Response::builder().status(status);
+                    for (k, v) in headers.into_iter() {
+                        builder = builder.header(k.unwrap(), v);
+                    }
+                    Ok(builder
+                        .body(CacheBody::Source(Full::new(Bytes::from(Vec::from(body)))))
+                        .unwrap())
                 }
-                Ok(builder
-                    .body(CacheBody::Source(Full::new(Bytes::from(Vec::from(body)))))
-                    .unwrap())
-            }),
-            None => {
-                let (mut parts, body) = req.into_parts();
-                let host = format!("{}:{}", self.config.target_host, self.config.target_port);
-                let new_uri = format!(
-                    "http://{}/{}?{}",
-                    host,
-                    parts.uri.path(),
-                    parts.uri.query().unwrap_or("")
-                );
-                parts.uri = new_uri.parse().unwrap();
-                parts
-                    .headers
-                    .insert(hyper::header::HOST, HeaderValue::from_str(&host).unwrap());
-                let new_req = Request::from_parts(parts, body);
-                let http_client = self.http_client.clone();
-                let cache = self.lru.clone();
-                Box::pin(async move {
+                None => {
+                    let (mut parts, body) = req.into_parts();
+                    let new_uri = format!(
+                        "http://{}/{}?{}",
+                        host,
+                        parts.uri.path(),
+                        parts.uri.query().unwrap_or("")
+                    );
+                    parts.uri = new_uri.parse().unwrap();
+                    parts
+                        .headers
+                        .insert(hyper::header::HOST, HeaderValue::from_str(&host).unwrap());
+                    let new_req = Request::from_parts(parts, body);
                     let mut conn = match http_client.get().await {
                         Ok(conn) => conn,
                         Err(err) => return Err(err.into()),
@@ -176,9 +173,9 @@ impl<'config> Service<Request<Incoming>> for CachingProxy<'config> {
                         }
                         Err(err) => Err(err.into()),
                     }
-                })
+                }
             }
-        }
+        })
     }
 }
 
@@ -187,9 +184,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     let target_host = "neverssl.com";
     let target_port = 80;
-
+	let redis_pool = Builder::default_centralized().build_pool(10)?;
+	redis_pool.init().await?;
     let http_client = ClientConnectionManager::new(format!("{}:{}", target_host, target_port));
-    let pool = Pool::builder().max_open(50).build(http_client);
+    let pool = Pool::builder().max_open(10).build(http_client);
     // We create a TcpListener and bind it to 127.0.0.1:3000
     let listener = TcpListener::bind(addr).await?;
     let svc = CachingProxy {
@@ -197,9 +195,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             target_host: Cow::from(target_host),
             target_port,
         },
-        lru: Arc::new(StdMutex::new(LruCache::new(NonZeroUsize::new(2).unwrap()))),
+        lru: RedisCache::new(redis_pool),
         http_client: pool,
     };
+	tokio::task::spawn_blocking(move ||  {
+		
+	});
 
     // We start a loop to continuously accept incoming connections
     loop {

@@ -1,6 +1,12 @@
+use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use crossbeam::channel::Receiver;
+use crossbeam::channel::Sender;
+use fred::bytes::Bytes;
+use fred::prelude::*;
+use futures::future::BoxFuture;
 use hyper::HeaderMap;
 use hyper::StatusCode;
 use hyper::header::CONTENT_LENGTH;
@@ -13,10 +19,13 @@ use phf::{phf_set, Set};
 static UNCACHED_HEADERS: Set<&'static str> = phf_set! {"content-length", "connection"};
 pub(crate) static CACHE_HEADER: &'static str = "X-CRAP-CACHE";
 
-pub(crate) trait ResponseCache: Clone + Send + Sync + Unpin {
-    type Error;
-    fn store_key(&mut self, key: String, content: &[u8]) -> Result<(), Self::Error>;
-    fn get_key(&self, key: &str) -> Result<Option<Vec<u8>>, Self::Error>;
+//ResponseCache impls should be cheaply cloneable so they can be cloned to move across threads
+pub(crate) trait ResponseCache: Clone + Send + Sync + Unpin +'static {
+    type Error: Send + Sync + Debug +'static;
+	// store_key is called in Drop and thus cannot be async
+	// errors should be logged for advisory purposes
+    fn store_key(self, key: String, content: Vec<u8>);
+	fn get_key(&self, key: &str) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, Self::Error>> + Send;
 }
 
 // A crappy cache implementation suitable for unit tests.
@@ -26,19 +35,53 @@ pub(crate) type MemCache = Arc<Mutex<LruCache<String, Vec<u8>>>>;
 impl ResponseCache for MemCache {
     type Error = anyhow::Error;
 
-    fn store_key(&mut self, key: String, content: &[u8]) -> Result<(), Self::Error> {
-        self.lock().unwrap().put(key, Vec::from(content));
-        Ok(())
+    fn store_key(self, key: String, content: Vec<u8>) {
+        self.lock().unwrap().put(key, content);
     }
 
-    fn get_key(&self, key: &str) -> Result<Option<Vec<u8>>, Self::Error> {
+    async fn get_key(&self, key: &str) -> Result<Option<Vec<u8>>, Self::Error> {
         Ok(self.lock().unwrap().get(key).cloned())
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct RedisCache {
+	client: fred::clients::RedisPool,
+	sender: Sender<BoxFuture<'static, Result<(), RedisError>>>
+}
+
+impl RedisCache {
+	pub(crate) fn new(pool: fred::clients::RedisPool) -> Self {
+		let (send, rec) = crossbeam::channel::unbounded();
+		tokio::task::spawn(async move {
+			loop {
+				let rec: Receiver<BoxFuture<'static, Result<(), RedisError>>> = rec.clone();
+				// TODO log this instead of unwraping. 
+				let _ = tokio::task::spawn_blocking(move || rec.recv()).await.unwrap().unwrap().await.unwrap();
+			}
+		});
+		RedisCache{
+			client: pool,
+			sender: send,
+		}
+	}
+
+	async fn cache_by_key(self, key: String, content: Vec<u8>) -> Result<(), RedisError> {
+		self.client.set::<(), String, Bytes>(key, content.into(), None, None, false).await
+	}
+}
+
+impl ResponseCache for RedisCache {
+	type Error = fred::error::RedisError;
+	fn store_key(self, key: String, content: Vec<u8>) {
+		let _ = self.sender.clone().send(Box::pin(self.cache_by_key(key, content)));
+	}
+	async fn get_key(&self, key: &str) -> Result<Option<Vec<u8>>, Self::Error> {
+		self.client.get(key).await
+	}
+}
 
 pub(crate) fn response_to_bytes(parts: &Parts) -> Vec<u8> {
-    // TODO handle things without a content-length (just forward them and don't cache)
     let body_size: usize = parts
         .headers
         .get(CONTENT_LENGTH)

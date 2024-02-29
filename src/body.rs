@@ -69,9 +69,9 @@ impl<Cache: cache::ResponseCache> Body for CacheBody<Cache> {
 
 pub(crate) struct IncomingTeeSink<Cache: ResponseCache> {
     inc: Incoming,
-    sink: Vec<u8>,
+    sink: Option<Vec<u8>>,
     frame_data: Vec<Bytes>,
-    cache: Cache,
+    cache: Option<Cache>,
     key: String,
 }
 
@@ -79,9 +79,9 @@ impl<Cache: cache::ResponseCache> IncomingTeeSink<Cache> {
     pub fn new(inc: Incoming, sink: Vec<u8>, cache: Cache, key: String) -> Self {
         Self {
             inc,
-            sink,
+            sink: Some(sink),
             frame_data: Vec::with_capacity(5),
-            cache,
+            cache: Some(cache),
             key,
         }
     }
@@ -129,14 +129,15 @@ impl<Cache: cache::ResponseCache> Body for IncomingTeeSink<Cache> {
 
 impl<Cache: cache::ResponseCache> Drop for IncomingTeeSink<Cache> {
     fn drop(&mut self) {
+		let mut sink = self.sink.take().unwrap();
+		let cache = self.cache.take().unwrap();
         if self.inc.is_end_stream() {
-            // TODO evaluate if this value is more recent than any already present
             for frame in self.frame_data.iter() {
                 for byte in frame.into_iter() {
-                    self.sink.push(*byte);
+                    sink.push(*byte);
                 }
             }
-            let _ = self.cache.store_key(self.key.clone(), &self.sink);
+            cache.store_key(self.key.clone(), sink);
         }
     }
 }
